@@ -14,7 +14,6 @@ elif sys.argv[1]== '192.168.2.8':
      cidr = "192.168.3.0/24"
 elif sys.argv[1]=='192.168.2.9':
      cidr = "192.168.4.0/24"
-print cidr
 #Glance
 from glanceclient.v2 import Client
 glance = Client(session=sess)
@@ -27,9 +26,8 @@ from neutronclient.v2_0 import client
 neutron = client.Client(session=sess)
 subnets = neutron.list_subnets()
 print "creating network....."
-networks=neutron.list_networks()
-external_netid=networks['networks'][-1]['id'] 
-
+networks=neutron.list_networks(name='public')
+external_netid=networks['networks'][0]['id'] 
 net=neutron.create_network(
                                body={
                                 "network": {
@@ -137,3 +135,4 @@ neutron.create_vpnservice(
 	   "router_id": router_id
            }
 })
+
