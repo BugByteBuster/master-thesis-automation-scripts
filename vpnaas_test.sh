@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+:`this the script to create n east-west vpnaas connections in a single devstack, 
+written to analyse the responsetime and cpu overhead
+`
+
 EXT_NW_ID=`neutron net-list | awk '/public/{print $2}'`
 neutron vpn-ikepolicy-create ikepolicy1
 neutron vpn-ipsecpolicy-create ipsecpolicy1
