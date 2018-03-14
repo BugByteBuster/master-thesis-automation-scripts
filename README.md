@@ -16,4 +16,4 @@ vpnaas_test.sh is the script to deploy n networks, n routers, n vpn services,
 1 IKEpolicy and 1 IPsec policy.
 
 the same ike and ipsec policy is used for all the vpn services
-it creates  east to west connections within the single devstack
+it creates n east to west connections within the single devstack
