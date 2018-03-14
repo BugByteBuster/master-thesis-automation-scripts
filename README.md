@@ -1,6 +1,6 @@
 this is the code to interact with Openstack..
 
-it does the following steps
+code.py does the following steps
 
 1. creates network..
 2. Creates subnet..
@@ -9,3 +9,11 @@ it does the following steps
 5. creates ike policy 
 6. creates ipsec policy 
 6. creates a vpn on the router created
+
+
+
+vpnaas_test.sh is the script to deploy n networks, n routers, n vpn services,
+1 IKEpolicy and 1 IPsec policy.
+
+the same ike and ipsec policy is used for all the vpn services
+it creates  east to west connections within the single devstack
