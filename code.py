@@ -59,11 +59,7 @@ nova = client.Client('2.1', session=sess)
 boot_flav= nova.flavors.find(name='m1.nano')
 print "booting instance...."
 instance_boot=nova.servers.create(name="instance1", image=boot_image, flavor=boot_flav, network=boot_subnet)
-
-
-
-
-#ugsdfgyu#creating router
+#creating router
 print "Creating the router and adding the interfaces......"
 router=neutron.create_router(
                              body={
