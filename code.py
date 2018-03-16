@@ -62,7 +62,8 @@ instance_boot=nova.servers.create(name="instance1", image=boot_image, flavor=boo
 
 
 
-#creating router
+
+#ugsdfgyu#creating router
 print "Creating the router and adding the interfaces......"
 router=neutron.create_router(
                              body={
