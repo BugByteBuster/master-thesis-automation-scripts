@@ -52,7 +52,6 @@ subnet=neutron.create_subnet(
 
 boot_subnet = subnet['subnet']['id']
 
-
 #Nova
 from novaclient import client
 nova = client.Client('2.1', session=sess)
