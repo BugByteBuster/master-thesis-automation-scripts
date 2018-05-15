@@ -17,3 +17,5 @@ vpnaas_test.sh is the script to deploy n networks, n routers, n vpn services,
 
 the same ike and ipsec policy is used for all the vpn services
 it creates n east to west connections within the single devstack
+
+simple_curl.sh is a simple bash file to create network subnet and upload image to openstack using curl commands
