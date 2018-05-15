@@ -1,0 +1,67 @@
+#!/bin/bash
+
+openstack router list
+nova list --all-tenants
+
+#deleting vm
+for vm in $(nova list --all-tenants | tail -n +4 | head -n -1 | awk '{print$2}')
+do
+    nova delete $vm
+done
+
+#deleting router and router ports
+
+for router in $(openstack router list | grep -w "router_first" | awk '{print $2}')
+do
+    openstack router delete $router
+    openstack router show $router
+    for subnet in $(openstack subnet list | grep  "subnet_" | awk '{print $2}')
+    do
+        openstack router remove subnet $router $subnet
+        openstack router delete $router
+    done
+done
+
+
+#deleting network
+for network in $(openstack network list | tail -n +6 | head -n -1 | awk '{print $2}')
+do
+   openstack network delete $network
+done
+
+#deleting image
+for image in $(openstack image list | tail -n +4 | head -n -1 | awk '{print $2}')
+do 
+    openstack image delete $image
+done
+
+#deleting isec
+for ipsec in $(neutron vpn-ipsecpolicy-list | tail -n +4 | head -n -1 | awk '{print $2}')
+do
+neutron vpn-ipsecpolicy-delete $ipsec 
+done
+
+
+#deleting ike
+
+for ike in $(neutron vpn-ikepolicy-list | tail -n +4 | head -n -1 | awk '{print $2}')
+do
+neutron vpn-ikepolicy-delete $ike 
+done
+
+#deleting vpnservice
+
+for service in $(neutron vpn-service-list | tail -n +4 | head -n -1 | awk '{print $2}')
+do
+neutron vpn-service-delete $service 
+done
+
+
+openstack network list
+openstack router list
+openstack subnet list
+openstack router list
+openstack image list
+neutron vpn-ipsecpolicy-list
+neutron vpn-ikepolicy-list
+neutron vpn-service-list 
