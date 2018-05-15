@@ -24,7 +24,7 @@ done
 
 
 #deleting network
-for network in $(openstack network list | tail -n +6 | head -n -1 | awk '{print $2}')
+for network in $(openstack network list | tail -n +4 |head -n -1 | grep "net" | awk '{print$2}')
 do
    openstack network delete $network
 done
