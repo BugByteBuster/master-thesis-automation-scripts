@@ -71,3 +71,4 @@ openstack image list
 neutron vpn-ipsecpolicy-list
 neutron vpn-ikepolicy-list
 neutron vpn-service-list 
+neutron vpn-endpoint-group-list
