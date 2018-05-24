@@ -56,6 +56,12 @@ do
 neutron vpn-service-delete $service 
 done
 
+#deleting endpoint group
+for endpoint in $(neutron vpn-endpoint-group-list | tail -n +4 | head -n -1 | awk '{print $2}')
+do
+neutron vpn-service-delete $endpoint 
+done
+
 
 openstack network list
 openstack router list
