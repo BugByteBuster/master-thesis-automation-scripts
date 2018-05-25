@@ -62,6 +62,11 @@ do
 neutron vpn-endpoint-group-delete $endpoint 
 done
 
+#deleting s2s connection
+for s2s in $(neutron ipsec-site-connection-list | tail -n+4 | head -n -1 |awk '{print $2}')
+do
+neutron ipsec-site-sconnection-delete $s2s
+
 
 openstack network list
 openstack router list
