@@ -9,8 +9,45 @@ do
     nova delete $vm
 done
 
-#deleting router and router ports
+#deleting s2s connection
+for s2s in $(neutron ipsec-site-connection-list | tail -n+4 | head -n -1 |awk '{print $2}')
+do
+neutron ipsec-site-connection-delete $s2s
+done
 
+#deleting ike
+for ike in $(neutron vpn-ikepolicy-list | tail -n +4 | head -n -1 | awk '{print $2}')
+do
+neutron vpn-ikepolicy-delete $ike 
+done
+
+#deleting endpoint group
+for endpoint in $(neutron vpn-endpoint-group-list | tail -n +4 | head -n -1 | awk '{print $2}')
+do
+neutron vpn-endpoint-group-delete $endpoint 
+done
+
+#deleting vpnservice
+for service in $(neutron vpn-service-list | tail -n +4 | head -n -1 | awk '{print $2}')
+do
+neutron vpn-service-delete $service 
+done
+
+
+#deleting isec
+for ipsec in $(neutron vpn-ipsecpolicy-list | tail -n +4 | head -n -1 | awk '{print $2}')
+do
+neutron vpn-ipsecpolicy-delete $ipsec 
+done
+
+#deleting image
+for image in $(openstack image list | tail -n +4 | head -n -1 | awk '{print $2}')
+do 
+    openstack image delete $image
+done
+
+
+#deleting router and router ports
 for router in $(openstack router list | grep -w "router_first" | awk '{print $2}')
 do
     openstack router delete $router
@@ -29,43 +66,6 @@ do
    openstack network delete $network
 done
 
-#deleting image
-for image in $(openstack image list | tail -n +4 | head -n -1 | awk '{print $2}')
-do 
-    openstack image delete $image
-done
-
-#deleting isec
-for ipsec in $(neutron vpn-ipsecpolicy-list | tail -n +4 | head -n -1 | awk '{print $2}')
-do
-neutron vpn-ipsecpolicy-delete $ipsec 
-done
-
-
-#deleting ike
-
-for ike in $(neutron vpn-ikepolicy-list | tail -n +4 | head -n -1 | awk '{print $2}')
-do
-neutron vpn-ikepolicy-delete $ike 
-done
-
-#deleting vpnservice
-
-for service in $(neutron vpn-service-list | tail -n +4 | head -n -1 | awk '{print $2}')
-do
-neutron vpn-service-delete $service 
-done
-
-#deleting endpoint group
-for endpoint in $(neutron vpn-endpoint-group-list | tail -n +4 | head -n -1 | awk '{print $2}')
-do
-neutron vpn-endpoint-group-delete $endpoint 
-done
-
-#deleting s2s connection
-for s2s in $(neutron ipsec-site-connection-list | tail -n+4 | head -n -1 |awk '{print $2}')
-do
-neutron ipsec-site-sconnection-delete $s2s
 
 
 openstack network list
