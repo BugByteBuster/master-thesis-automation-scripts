@@ -48,7 +48,7 @@ done
 
 
 #deleting router and router ports
-for router in $(openstack router list | grep -w "router_first" | awk '{print $2}')
+for router in $(openstack router list | grep -w "router_" | awk '{print $2}')
 do
     openstack router delete $router
     openstack router show $router
