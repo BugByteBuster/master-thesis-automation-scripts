@@ -1,0 +1,879 @@
+
+from openstack_agent.services.keystone.keystone_agent import \
+    get_connection_params
+from openstack_agent.common import *
+from openstack_agent.services.scheduler.scheduler import *
+from openstack_agent.db.db import *
+from openstack_agent.models import *
+import eventlet; eventlet.monkey_patch()
+import requests
+import time
+
+from openstack_agent.logger.agent_logger import AgentLogger
+
+logger = AgentLogger(__name__, level=AgentLogger.DEBUG)
+
+SYNCED = not common.DB_CLEAN_ON_START
+
+
+def _sync(idp_token):
+    global SYNCED
+    if SYNCED:
+        return
+    sp_token, endpoint_url = get_connection_params(idp_token, AGENT_SP_ID,
+                                                   'network')
+    headers = {}
+    headers['Host'] = endpoint_url.split('/')[2]
+    headers['X-Auth-Token'] = sp_token
+
+    # networks
+    resp = requests.get(
+        url='{}/v2.0/networks'.format(endpoint_url), headers=headers).json()
+    for net_info in resp['networks']:
+        add_to_DB(
+            Network(
+                local_id=net_info['id'],
+                sp_id=AGENT_SP_ID,
+                remote_id=net_info['id'],
+                name=net_info['name']))
+    # subnets
+    resp = requests.get(
+        url='{}/v2.0/subnets'.format(endpoint_url), headers=headers).json()
+    for subnet_info in resp['subnets']:
+        add_to_DB(
+            Subnet(
+                net_id=subnet_info['network_id'],
+                local_id=subnet_info['id'],
+                remote_id=subnet_info['id'],
+                name=subnet_info['name'],
+                cidr=subnet_info['cidr'],
+                ipv=subnet_info['ip_version'],
+                sp_id=AGENT_SP_ID))
+
+    resp = requests.get(
+        url='{}/v2.0/routers'.format(endpoint_url), headers=headers).json()
+    for router_info in resp['routers']:
+        add_to_DB(
+            Router(
+                local_id=router_info['id'],
+                sp_id=AGENT_SP_ID,
+                remote_id=router_info['id'],
+                name=router_info['name']))
+
+    SYNCED = True
+
+
+def neutron_proxy_to_sp(env, data=None, sp_id=AGENT_SP_ID):
+    idp_token = env['HTTP_X_AUTH_TOKEN']
+
+    if not SYNCED:
+        _sync(idp_token)
+
+    sp_token, endpoint_url = get_connection_params(idp_token, sp_id, 'network')
+    headers = dict(env['headers_raw'])
+    headers['Host'] = endpoint_url.split('/')[2]
+    headers['X-Auth-Token'] = sp_token
+    query_string = env.get('QUERY_STRING', '')
+    req_path = '/'.join(env['PATH_INFO'].split('/')[2:])
+    url = endpoint_url + req_path + ('?' + query_string
+                                     if query_string else '')
+    logger.debug('proxying {} to {}'.format(env['PATH_INFO'], url))
+    data = env['wsgi.input'].read() if not data else data
+    logger.debug('proxy {} to {} at url {}'.format(env['REQUEST_METHOD'],
+                                                   sp_id, url))
+    resp = requests.request(
+        method=env['REQUEST_METHOD'], url=url, data=data, headers=headers)
+    if resp.status_code >= 300:
+        logger.debug('proxy {} to {} at url {} returned {}:{}'.format(
+            env['REQUEST_METHOD'], sp_id, url, resp.status_code, resp.text))
+    return str(resp.status_code), resp.headers.items(), resp.text
+
+
+def create_network(env):
+    status_code, headers, data = neutron_proxy_to_sp(env)
+    if int(status_code) >= 300:
+        return status_code, headers, data
+    net_info = json.loads(data)['network']
+    add_to_DB(
+        Network(
+            local_id=net_info['id'],
+            sp_id=AGENT_SP_ID,
+            remote_id=net_info['id'],
+            name=net_info['name']))
+    return status_code, headers, data
+
+
+def create_subnet(env):
+    req_data = env['wsgi.input'].read()
+    status_code, headers, data = neutron_proxy_to_sp(env, req_data)
+    if int(status_code) >= 300:
+        return status_code, headers, data
+    subnet_info = json.loads(data)['subnet']
+    subnet_req_info = json.loads(req_data)['subnet']
+    add_to_DB(
+        Subnet(
+            net_id=subnet_info['network_id'],
+            local_id=subnet_info['id'],
+            remote_id=subnet_info['id'],
+            name=subnet_info['name'],
+            cidr=subnet_req_info['cidr'],
+            ipv=subnet_req_info['ip_version'],
+            sp_id=AGENT_SP_ID))
+    return status_code, headers, data
+
+
+def create_router(env):
+    status_code, headers, data = neutron_proxy_to_sp(env)
+    if int(status_code) >= 300:
+        return status_code, headers, data
+    router_info = json.loads(data)['router']
+    print router_info
+    external_gw = router_info['external_gateway_info']
+    if external_gw != None:
+        external_gw_ip = external_gw['external_fixed_ips'][0]['ip_address']
+    else:
+        external_gw_ip = 'Not Assigned'
+    add_to_DB(
+        Router(
+            local_id=router_info['id'],
+            sp_id=AGENT_SP_ID,
+            remote_id=router_info['id'],
+            name=router_info['name'],
+            Ext_Gateway=external_gw_ip
+        )
+    )
+    return status_code, headers, data
+
+
+def add_gateway_router(env):
+    req_data = env['wsgi.input'].read()
+    status_code, headers, data = neutron_proxy_to_sp(env, req_data)
+    if int(status_code) >= 300:
+        return status_code, headers, data
+    resp = json.loads(data)['router']
+    ext_gw_ip = resp['external_gateway_info']['external_fixed_ips'][0]['ip_address']
+    router_id = resp['id']
+    router_info = query_from_DB(Router, {"remote_id": router_id})
+    print router_info
+    for router in router_info:
+        sp_id = router.sp_id
+    update_in_DB(Router,
+                 columns=[Router.remote_id, Router.sp_id],
+                 keywords=[router_id, sp_id],
+                 new_value_dic={'Ext_Gateway': ext_gw_ip})
+    return status_code, headers, data
+
+
+remote_router_ids = []
+sp_ids = []
+
+
+def write(input):
+    results = open("results", "a")
+    results.write(input)
+
+
+def add_router_interface(env):
+    t1 = time.time()
+    "on receiving the request we handle it in the agent cloud"
+    idp_token = env['HTTP_X_AUTH_TOKEN']
+    req_data = env['wsgi.input'].read()
+    status_code, headers, data = neutron_proxy_to_sp(env, req_data)
+    if int(status_code) >= 300:
+        return status_code, headers, data
+    port_info = json.loads(data)
+    add_to_DB(
+        Router_ports(
+            router_id=port_info['id'],
+            local_id=port_info['port_id'],
+            remote_id=port_info['port_id'],
+            sp_id=AGENT_SP_ID,
+            subnet_id=port_info['subnet_id'],
+            network_id=port_info['network_id']
+        )
+    )
+    write("1. time taken to handle the router port request in agent cloud  "+str(time.time()-t1)+'\n')
+    t2=time.time()
+    router_id = env['PATH_INFO'].split('/')[-2]
+    req_data2 = json.loads(req_data)
+    subnet_id = req_data2['subnet_id']
+    result = query_from_DB(Subnet, {"local_id": subnet_id})
+    if len(result) > 1:
+        subnet_deployed = result[1:]
+        for item in subnet_deployed:
+            #remote_subnet_id = (str(item).split(",")[2]).split("=")[1]
+            to_sp = (str(item).split(",")[1]).split("=")[1]
+            #logger.debug('subnetwork {} already deployed as {} at sp {}'.format(
+             #   subnet_id, remote_subnet_id, to_sp))
+            #logger.debug('duplicating the router {} at sp {} where subnet:{} is deployed'.format(
+              #  router_id, to_sp, subnet_id))
+            remote_router_id = duplicate_router(idp_token, router_id, to_sp, from_sp=AGENT_SP_ID)
+            #logger.debug('router{} created at sp {} as  {}'.format(router_id, to_sp, remote_router_id))
+            remote_router_ids.append(remote_router_id)
+            duplicate_router_ports(idp_token, port_info['port_id'], to_sp,
+                                   from_sp=AGENT_SP_ID)
+        write("2.time_taken to duplicate router and router port "+str(time.time()-t2)+'\n')
+    """
+        after duplicating the router and ports to remote cloud now we are addin ipsec and ike policy
+        if the router has more than one interface"""
+    t3=time.time()
+    query = query_from_DB(Router, {"local_id": router_id})
+    if len(query) > 2:
+        deployed_routers_info = query[1:]
+        for item in deployed_routers_info:
+            sp_id = (str(item).split(",")[2]).split("=")[1]
+            ipsec_query = query_from_DB(IPSEC_policy, {"sp_id": sp_id})
+            if not ipsec_query:
+                create_IPSec_policy(idp_token, sp_id)
+                create_IKE_policy(idp_token, sp_id)
+
+
+        # creating vpnservice
+        for item in remote_router_ids:
+            query_router = query_from_DB(Router, {'remote_id': item})
+            sp_id2 = (str(query_router).split(",")[2]).split("=")[1]
+            query_router_port = query_from_DB(Router_ports, {'router_id': item, 'sp_id': sp_id2})
+            subnet_id = (str(query_router_port).split(",")[4]).split("=")[1]
+            query_vpnservice = query_from_DB(VPN_service,
+                                             {'sp_id': sp_id2,
+                                              'name': "myservice#" + item})
+            if not query_vpnservice:
+                create_vpn_service(idp_token, sp_id2, item, subnet_id)
+                sp_ids.append(sp_id2)
+                write("3.time_taken to create ipsec, ike and vpn service " + str(time.time() - t3) + '\n')
+    t4=time.time()
+    if len(sp_ids) == 2:
+        for i in range(0, len(sp_ids)):
+            query_vpn_service = query_from_DB(VPN_service, {'sp_id': sp_ids[i]})
+            vpn_service_name = ((str(query_vpn_service).split(",")[2]).split("=")[1])  # .replace(")>]", "")
+            vpn_service_router = str(vpn_service_name).split('#')[1]
+            peer_router_info = query_from_DB(Router, {'remote_id': vpn_service_router})
+
+            peer_router_gw = ((str(peer_router_info).split(",")[4]).split("=")[1]).replace(")>]", "")
+
+            peer_port_info = query_from_DB(Router_ports, {'router_id': vpn_service_router})
+            peer_subnet_cidrs = []
+            for j in range(0, len(peer_port_info)):
+                peer_subnet_id = (str(peer_port_info[j]).split(",")[4]).split("=")[1]
+                # with subnet_id querying subnets table to get the cidr
+                peer_subnet_info = query_from_DB(Subnet, {'remote_id': peer_subnet_id})
+                peer_subnet_cidrs.append(((str(peer_subnet_info).split(",")[4]).split("=")[1]).replace(")>]", ""))
+            if len(peer_subnet_cidrs) > 1:
+                eventlet.spawn_n(create_vpn_endpoint_group, idp_token, sp_ids[i], peer_subnet_cidrs)
+
+            if i == 0:
+                create_vpn_s2s(idp_token, sp_ids[1], peer_router_gw, peer_subnet_cidrs)
+            if i == 1:
+                create_vpn_s2s(idp_token, sp_ids[0], peer_router_gw, peer_subnet_cidrs)
+            write("4.time_taken to establish s2s connectivity " + str(time.time() - t4) + '\n')
+    t5=time.time()
+    if len(query) > 3:
+        raw_query = load_column()
+        sp_id = [item[0] for item in raw_query]
+        sp_id = sp_id[1:]
+        sub_id=req_data2['subnet_id']
+        destination_subnet_info = query_from_DB(Subnet, {'sp_id': sp_id[-1], 'local_id': sub_id})
+        destination_subnet_cidr=((str(destination_subnet_info).split(",")[4]).split("=")[1].replace(")>]", ""))
+        pool = eventlet.GreenPool(len(sp_id) + (len(query) - 4))
+        write("No of threads spawned "+str(len(sp_id) + (len(query) - 4))+'\n')
+        write("***********threads_started***********"+'\n')
+        for item in sp_id:
+            pool.spawn_n(create_vpn_extra_router, idp_token, item, destination_subnet_cidr)
+        for i in range(0, len(query) - 4):  # 4 because one is covered in the above loop
+            pool.spawn_n(create_vpn_extra_router, idp_token, sp_ids[-1], destination_subnet_cidr)
+        pool.waitall()
+        write("*******threads ended*****************")
+        write("5.time_taken_for_thread "+str(time.time()-t5)+'\n')
+        t6 = time.time()
+
+        query_details = query_from_DB(VPN_routers, {'sp_id': sp_id[-1], 'vpn_connectivity': "NO"})
+        query_details2 = query_DB(sp_id[-1])
+        mapper = []
+        pool = eventlet.GreenPool((len(query_details)+len(query_details2)))
+        for i in range(len(query_details)):
+            mapper.extend((query_details[i], query_details2[i]))
+            # routers in mapper should be connected with each other via vpnaas
+            conn_router_ids = []
+            sp_ids_connect = []
+            for item in mapper:
+                sp_connect_id = ((str(item).split(",")[0]).split("=")[1])
+                conn_router_id = ((str(item).split(",")[1]).split("=")[1])
+                sp_ids_connect.append(sp_connect_id)
+                conn_router_ids.append(conn_router_id)
+
+            for i in range(0, len(sp_ids_connect)):
+                query_vpn_service = query_from_DB(VPN_service, {'sp_id': sp_ids_connect[i],
+                                                                'name': "myservice#" + conn_router_ids[i]})
+                vpn_service_name = ((str(query_vpn_service[0]).split(",")[2]).split("=")[1])
+                vpn_router_id = str(vpn_service_name).split('#')[1]
+                peer_router_info = query_from_DB(VPN_routers, {'router_id': vpn_router_id})
+                peer_router_gtw = ((str(peer_router_info).split(",")[2]).split("=")[1])
+                # peer_port_info = query_from_DB(Router_ports, {'router_id': vpn_router_id})
+                peer_subnet_cidrs = []
+                for j in range(0, len(peer_router_info)):
+                    peer_subnet_id = (str(peer_router_info[j]).split(",")[3]).split("=")[1]
+                    # with subnet_id querying subnets table to get the cidr
+                    peer_subnet_info = query_from_DB(Subnet, {'remote_id': peer_subnet_id})
+                    peer_subnet_cidrs.append(((str(peer_subnet_info).split(",")[4]).split("=")[1]).replace(")>]", ""))
+                if len(peer_subnet_cidrs) > 1:
+                    eventlet.spawn_n(create_vpn_endpoint_group, idp_token, sp_ids_connect[i], peer_subnet_cidrs)
+                if i == 0:
+                    eventlet.spawn_n(create_vpn_s2s, idp_token, sp_ids_connect[1], peer_router_gtw, peer_subnet_cidrs)
+                    #create_vpn_s2s(idp_token, sp_ids_connect[1], peer_router_gtw, peer_subnet_cidrs)
+                if i == 1:
+                    eventlet.spawn_n(create_vpn_s2s, idp_token, sp_ids_connect[0], peer_router_gtw, peer_subnet_cidrs)
+                    #create_vpn_s2s(idp_token, sp_ids_connect[0], peer_router_gtw, peer_subnet_cidrs)
+            mapper = []
+        pool.waitall()
+        write("6.time taken for creating s2s " + str(time.time() - t6) + '\n')
+    time_taken=time.time() - t1
+    write("*****************************************time taken to add subnet  "+str(time_taken)+'\n')
+    write("************************************DONE*******************************************"+'\n')
+
+    return status_code, headers, data
+
+
+def create_vpn_extra_router(idp_token, sp_id, destination_subnet_cidr):
+    time_taken_extra_routers=time.time()
+    #logger.debug('setting up extra routers')
+    #logger.debug('1.getting external net_id')
+    to_sp_token, to_endpoint_url = get_connection_params(
+        idp_token, sp_id, 'network')
+    url1 = to_endpoint_url + '/v2.0/networks'
+    resp1 = requests.get(
+        url1, headers={
+            'X-Auth-Token': to_sp_token
+        })
+    resp1 = resp1.json()
+    # below loop is for getting external_network_id from the response
+    for network in resp1['networks']:
+        if network['name'] == 'public':
+            ext_net = network['id']
+    write("5*.time taken to get external network_id: "+str(time.time()-time_taken_extra_routers)+'\n')
+    # ext_net = resp1['networks'][0]['id']
+    time_router=time.time()
+    #logger.debug('2.creating router vpnextra')
+    # now we create a router with external gateway
+
+    url2 = to_endpoint_url + '/v2.0/routers'
+    router_post_data = {
+        "router": {
+            "name": "router_vpnextra",
+            "external_gateway_info": {
+                "network_id": ext_net
+
+            }
+        }
+    }
+    resp_router = requests.post(url2,
+                                json=router_post_data, headers={
+            'X-Auth-Token': to_sp_token
+        })
+    router_info = resp_router.json()
+    router_info = router_info['router']
+    router_id = router_info['id']
+    external_gw = router_info['external_gateway_info']['external_fixed_ips'][0]['ip_address']
+    write("5**.time taken to create only router extra "+str(time.time()-time_router)+'\n')
+    # before attaching the interface to the router we need to create a port in the network if not created the below error comes up
+    # error "{u'NeutronError': {u'message': u'IP address 192.168.10.1
+    # already allocated in subnet d4d58a59-91cf-49b8-8a4a-39ff050df667', u'type': u'IpAddressAlreadyAllocated', u'detail': u''}}"
+    # to avoid this error we need to create the port in the network
+    time_port=time.time()
+    network = query_from_DB(Network, {"sp_id": sp_id})
+    network_id = (str(network).split(",")[3]).split("=")[1]
+    network_id = network_id.replace(")>]", "")
+    #logger.debug('3.setting up port to attach subnet')
+    # create port
+    port_post_data = {"port": {"network_id": network_id}}
+    url_port = to_endpoint_url + 'v2.0/ports'
+    resp_port = requests.post(url_port,
+                              json=port_post_data,
+                              headers={
+                                  'X-Auth-Token': to_sp_token
+                              })
+    resp_port = resp_port.json()
+    write("5***.time taken to create port only " + str(time.time() - time_port) + '\n')
+    time_attach_subnet=time.time()
+    next_hop=resp_port['port']['fixed_ips'][0]['ip_address']
+    port_id = resp_port['port']['id']
+    # attach subnet to router
+    subnet = query_from_DB(Subnet, {"net_id": network_id})
+    subnet_id = (str(subnet).split(",")[2]).split("=")[1]
+    interface_post_data = {"port_id": port_id}
+    url_interface = to_endpoint_url + 'v2.0/routers/' + router_id + '/add_router_interface'
+    #logger.debug('4.adding subnet to the router')
+    resp_interface = requests.put(url_interface,
+                                  json=interface_post_data, headers={
+            'X-Auth-Token': to_sp_token
+        })
+    add_to_DB(
+        VPN_routers(
+            sp_id=sp_id,
+            router_id=router_id,
+            external_gw=external_gw,
+            subnet_attached=subnet_id,
+            vpn_connectivity="NO"
+
+        )
+    )
+    write("5****.time_taken to attach subnet to router "+str(time.time()-time_attach_subnet)+'\n')
+    # initiate vpn service on this router
+    create_vpn_service(idp_token, sp_id, router_id, subnet_id)
+    update_routes(idp_token, sp_id, subnet_id, destination_subnet_cidr, next_hop)
+    write("5 total*.time taken to create extra routers " + str(time.time() - time_taken_extra_routers) + '\n')
+    return 0
+
+
+def create_vpn_service(idp_token, to_sp, router_id, subnet_id):
+    time_taken_vpnservice=time.time()
+    to_sp_token, to_endpoint_url = get_connection_params(
+        idp_token, to_sp, 'network')
+    url = to_endpoint_url + '/v2.0/vpn/vpnservices'
+    #logger.debug('creating VPN service')
+    post_data = {
+        "vpnservice": {
+            "router_id": router_id,
+            "name": "myservice#" + router_id,
+            "subnet_id": subnet_id
+        }
+    }
+    #logger.debug('5.creating vpnservice at {}'.format(to_sp))
+    resp = requests.post(
+        url, json=post_data, headers={
+            'X-Auth-Token': to_sp_token
+        })
+    VPN_service_info = resp.json()
+    add_to_DB(VPN_service(sp_id=to_sp,
+                          name=VPN_service_info['vpnservice']['name'],
+                          status="Unused",
+                          id=VPN_service_info['vpnservice']['id']
+                          ))
+    # step2 creating s2s connectivity
+    write("5*****. time taken to create VPN service on the router "+ str(time.time()-time_taken_vpnservice)+'\n')
+    return VPN_service_info['vpnservice']['id']
+
+
+def create_vpn_endpoint_group(idp_token, to_sp, peer_subnet_cidrs):
+    to_sp_token, to_endpoint_url = get_connection_params(
+        idp_token, to_sp, 'network')
+    url = to_endpoint_url + '/v2.0/vpn/endpoint-groups'
+    endpoint_group_post_data = {
+        "endpoint_group": {
+            "endpoints": peer_subnet_cidrs,
+            "type": "cidr",
+        }
+    }
+    resp = requests.post(url,
+                         json=endpoint_group_post_data,
+                         headers={'X-Auth-Token': to_sp_token}
+                         )
+    resp = resp.json()
+    cidrs = resp['endpoint_group']['endpoints']
+    cidrs = " ".join(str(x) for x in cidrs)
+    add_to_DB(
+        end_point_groups(
+            sp_id=to_sp,
+            id=resp['endpoint_group']['id'],
+            cidrs=cidrs))
+
+    return 0
+
+
+def get_router_detail(env):
+    router_id = env['PATH_INFO'].split('/')[-1]
+    return neutron_proxy_to_sp(env)
+
+
+def get_network_detail(env):
+    net_id = env['PATH_INFO'].split('/')[-1]
+    #    duplicate_network(env['HTTP_X_AUTH_TOKEN'], net_id, 'testsp2')
+    return neutron_proxy_to_sp(env)
+
+
+def get_subnet_detail(env):
+    subnet_id = env['PATH_INFO'].split('/')[-1]
+    #    duplicate_subet(env['HTTP_X_AUTH_TOKEN'], subnet_id, 'testsp2')
+    return neutron_proxy_to_sp(env)
+
+
+def duplicate_all(idp_token, net_id, to_sp, from_sp=AGENT_SP_ID):
+    routers_with_interfaces = []
+    remote_id = duplicate_network(idp_token, net_id, to_sp, from_sp)
+    # with network id querying subnets
+    subnets = query_from_DB(Subnet, {'net_id': net_id, 'sp_id': from_sp})
+    for subnet in subnets:
+        duplicate_subnet(idp_token, subnet.local_id, to_sp, from_sp)
+        # with subnet_id querying routerports for routerid
+        routers_with_interfaces.append(query_from_DB(Router_ports,
+                                                     {'subnet_id': subnet.local_id, 'sp_id': from_sp}))
+    for router in routers_with_interfaces:
+        for router in router:
+            # for loop twice to get router id from the appended array
+            duplicate_router_complete(idp_token, router.router_id, to_sp, from_sp)
+    return remote_id
+
+
+def duplicate_network(idp_token, net_id, to_sp,
+                      from_sp=AGENT_SP_ID):  # and subnetwork
+    logger.debug('duplicating net {} to {}'.format(net_id, to_sp))
+    nets = query_from_DB(Network, {'local_id': net_id, 'sp_id': to_sp})
+    if nets:
+        remote_id = nets[0].remote_id
+        logger.debug('network {} already exists at {} as {}'.format(
+            net_id, to_sp, remote_id))
+        return remote_id
+    logger.debug('network {} doesn'
+                 't exist at {}, creating ...'.format(net_id, to_sp))
+    net_info = query_from_DB(Network, {'local_id': net_id, 'sp_id': from_sp})
+    if not net_info:
+        logger.debug('network {} doesn'
+                     't exist at {} either, not creating'.format(
+            net_id, from_sp))
+        return ''
+
+    post_data = {"network": {"name": net_info[0].name, "admin_state_up": True}}
+    to_sp_token, to_endpoint_url = get_connection_params(
+        idp_token, to_sp, 'network')
+    url = to_endpoint_url + 'v2.0/networks'
+    resp2 = requests.post(
+        url, json=post_data, headers={
+            'X-Auth-Token': to_sp_token
+        })
+    net_info = resp2.json()['network']
+    add_to_DB(Network(local_id=net_id,
+                      sp_id=to_sp,
+                      remote_id=net_info['id'],
+                      name=net_info['name']))
+    return net_info['id']
+
+
+def duplicate_subnet(idp_token, subnet_id, to_sp,
+                     from_sp=AGENT_SP_ID):  # and subnetwork
+    logger.debug('duplicating subnet {} to {}'.format(subnet_id, to_sp))
+    subnets = query_from_DB(Subnet, {'local_id': subnet_id, 'sp_id': to_sp})
+    if subnets:
+        remote_subnet_id = subnets[0].remote_id
+        logger.debug('subnetwork {} already exists at {} as {}'.format(
+            subnet_id, to_sp, remote_subnet_id))
+        return remote_subnet_id
+    logger.debug('subnet {} doesn'
+                 't exist at {}, creating ...'.format(subnet_id, to_sp))
+    subnet_info = query_from_DB(Subnet, {
+        'local_id': subnet_id,
+        'sp_id': from_sp
+    })
+    if not subnet_info:
+        logger.debug('subnet {} doesn'
+                     't exist at {} either, not creating'.format(
+            subnet_id, from_sp))
+        return ''
+
+    net_info = query_from_DB(Network, {
+        'local_id': subnet_info[0].net_id,
+        'sp_id': to_sp
+    })
+    if not net_info:
+        logger.debug('subnet {} doesn'
+                     't  have its network at {}, not creating'.format(
+            subnet_id, to_sp))
+        return ''
+
+    post_data = {
+        "network_id": net_info[0].remote_id,
+        "ip_version": subnet_info[0].ipv,
+        "cidr": subnet_info[0].cidr,
+        "name": subnet_info[0].name
+    }
+    post_data = {'subnet': post_data}
+
+    to_sp_token, to_endpoint_url = get_connection_params(
+        idp_token, to_sp, 'network')
+    url = to_endpoint_url + 'v2.0/subnets'
+    resp2 = requests.post(
+        url, json=post_data, headers={
+            'X-Auth-Token': to_sp_token
+        }).json()
+    subnet_info = resp2['subnet']
+    add_to_DB(
+        Subnet(local_id=subnet_id,
+               sp_id=to_sp,
+               remote_id=subnet_info['id'],
+               name=subnet_info['name'],
+               cidr=subnet_info['cidr'],
+               ipv=subnet_info['ip_version'],
+               net_id=net_info[0].remote_id
+
+               ))
+    return subnet_info['id']
+
+
+def duplicate_router_complete(idp_token, router_id, to_sp, from_sp=AGENT_SP_ID):
+    remote_id = duplicate_router(idp_token, router_id, to_sp, from_sp=AGENT_SP_ID)
+    router_ports = query_from_DB(Router_ports, {'router_id': router_id, 'sp_id': from_sp})
+    # single router may have more than one port
+    for port in router_ports:
+        duplicate_router_ports(idp_token, port.local_id, to_sp, from_sp)
+    return remote_id
+
+
+def duplicate_router(idp_token, router_id, to_sp,
+                     from_sp=AGENT_SP_ID):
+    time_taken_duplicate=time.time()
+    #logger.debug('duplicating router {} to {}'.format(router_id, to_sp))
+    routers = query_from_DB(Router, {'local_id': router_id, 'sp_id': to_sp})
+    if routers:
+        remote_router_id = routers[0].remote_id
+        #logger.debug('router {} already exists at {} as {}'.format(
+            #router_id, to_sp, remote_router_id))
+        return remote_router_id
+    #logger.debug('router {} doesn'
+                 #'t exist at {}, creating ...'.format(router_id, to_sp))
+    router_info =query_from_DB(Router, {'local_id': router_id, 'sp_id': from_sp})
+    if not router_info:
+        #logger.debug('router {} doesn'
+                     #'t exist at {} either, not creating'.format(
+            #router_id, from_sp))
+        return ''
+    post_data = {"router": {"name": router_info[0].name}}  # bug doubt what if multiple routers exists
+    to_sp_token, to_endpoint_url = get_connection_params(
+        idp_token, to_sp, 'network')
+    url = to_endpoint_url + 'v2.0/routers'
+    resp2 = requests.post(
+        url, json=post_data, headers={
+            'X-Auth-Token': to_sp_token
+        })
+    router_info2 = resp2.json()['router']
+
+    for router in router_info:
+        Ext_Gateway = router.Ext_Gateway
+    if Ext_Gateway != 'Not Assigned':
+        ext_gw_ip = duplicate_router_external_gw(router_info2['id'], to_sp_token, to_endpoint_url)
+    else:
+        ext_gw_ip = 'Not assigned'
+
+    add_to_DB(Router(local_id=router_id,
+                     sp_id=to_sp,
+                     remote_id=router_info2['id'],
+                     name=router_info2['name'],
+                     Ext_Gateway=ext_gw_ip, ))
+
+    add_to_DB(VPN_routers(sp_id=to_sp,
+                          router_id=router_info2['id'],
+                          external_gw=ext_gw_ip,
+                          subnet_attached="",
+                          vpn_connectivity=""))
+
+    write("2*.time_taken_for_duplicate_router "+str(time.time()-time_taken_duplicate)+'\n')
+    return router_info2['id']
+
+
+def duplicate_router_external_gw(router_id, to_sp_token, to_endpoint_url):
+    url = to_endpoint_url + 'v2.0/networks'
+    resp = requests.get(url, headers={'X-Auth-Token': to_sp_token})
+    resp = json.loads(resp.text)['networks']
+    for network in resp:
+        if network['name'] == 'public':
+            public_network_id = network['id']
+            public_network_id = public_network_id.encode("utf-8")
+    post_url = to_endpoint_url + 'v2.0/routers/{}'.format(router_id)
+    post_data = {"router": {"external_gateway_info": {"network_id": public_network_id}}}
+    post_data = json.dumps(post_data)
+    resp2 = requests.put(post_url,
+                         data=post_data,
+                         headers={'X-Auth-Token': to_sp_token, "Content-Type": "application/json"})
+    resp2 = json.loads(resp2.text)
+    ext_gw_ip = resp2['router']['external_gateway_info']['external_fixed_ips'][0]['ip_address']
+    return ext_gw_ip
+
+
+def duplicate_router_ports(idp_token, port_id, to_sp,
+                           from_sp=AGENT_SP_ID):
+    time_taken_duplicate_port=time.time()
+    #logger.debug('duplicating router-port {} to {}'.format(port_id, to_sp))
+    ports = query_from_DB(Router_ports, {'local_id': port_id, 'sp_id': to_sp})
+    if ports:
+        remote_port_id = ports[0].remote_id
+        #logger.debug('port {} already exists at {} as {}'.format(
+            #port_id, to_sp, remote_port_id))
+        return remote_port_id
+    #logger.debug('port {} doesn'
+                 #'t exist at {}, creating ...'.format(port_id, to_sp))
+    port_info = query_from_DB(Router_ports, {'local_id': port_id, 'sp_id': from_sp})
+    if not port_info:
+        #logger.debug('port {} doesn'
+                     #'t exist at {} either, not creating'.format(
+            #port_id, from_sp))
+        return ''
+    # below loop for getting agent cloud router_id(for which  the current interface exist) from port_info
+    for agent_router in port_info:
+        agent_router_id = agent_router.router_id
+        agent_router_port_id = agent_router.local_id
+    remote_router_info = query_from_DB(Router, {'local_id': agent_router_id, 'sp_id': to_sp})
+    for remote_router in remote_router_info:
+        remote_router_id = remote_router.remote_id
+
+    subnet_info = query_from_DB(Subnet, {'local_id': port_info[0].subnet_id, 'sp_id': to_sp})
+    if not subnet_info:
+        return 0
+    else:
+        post_data = {"subnet_id": subnet_info[0].remote_id}
+        to_sp_token, to_endpoint_url = get_connection_params(
+            idp_token, to_sp, 'network')
+        url = to_endpoint_url + 'v2.0/routers/{}/add_router_interface'.format(remote_router_id)
+        resp2 = requests.put(
+            url=url, json=post_data, headers={
+                'X-Auth-Token': to_sp_token
+            })
+        port_info = resp2.json()
+        add_to_DB(Router_ports(router_id=port_info['id'],
+                               local_id=port_id,
+                               remote_id=port_info['port_id'],
+                               sp_id=to_sp,
+                               subnet_id=port_info['subnet_id'],
+                               network_id=port_info['network_id']
+                               ))
+
+        update_in_DB(VPN_routers,
+                     columns=[VPN_routers.router_id],
+                     keywords=[remote_router_id],
+                     new_value_dic={"subnet_attached": subnet_info[0].remote_id, "vpn_connectivity": "NO"})
+
+        write("2**. Time taken to duplicate router port "+str(time.time()-time_taken_duplicate_port) + '\n')
+        return port_info['port_id']
+
+
+def create_IPSec_policy(idp_token, to_sp):
+    time_taken_ipsec = time.time()
+    post_data = {
+        "ipsecpolicy": {
+            "name": "ipsecpolicy1",
+            "transform_protocol": "esp",
+            "auth_algorithm": "sha1",
+            "encapsulation_mode": "tunnel",
+            "encryption_algorithm": "aes-256",
+            "pfs": "group5",
+            "lifetime": {
+                "units": "seconds",
+                "value": 7200
+            }
+        }
+    }
+    to_sp_token, to_endpoint_url = get_connection_params(
+        idp_token, to_sp, 'network')
+    url = to_endpoint_url + '/v2.0/vpn/ipsecpolicies'
+    #logger.debug('creating IPSec Policy')
+    resp = requests.post(
+        url, json=post_data, headers={
+            'X-Auth-Token': to_sp_token
+        })
+    IPSec_info = resp.json()
+    add_to_DB(IPSEC_policy(sp_id=to_sp,
+                           name=IPSec_info['ipsecpolicy']['name'],
+                           id=IPSec_info['ipsecpolicy']['id']
+                           ))
+    write("3*. Time taken to create ipsec policy "+ str(time.time()-time_taken_ipsec)+ '\n')
+    return IPSec_info['ipsecpolicy']['id']
+
+
+def create_IKE_policy(idp_token, to_sp):
+    time_taken_ike = time.time()
+    post_data = {
+        "ikepolicy": {
+            "phase1_negotiation_mode": "main",
+            "auth_algorithm": "sha1",
+            "encryption_algorithm": "aes-256",
+            "pfs": "group5",
+            "lifetime": {
+                "units": "seconds",
+                "value": 7200
+            },
+            "ike_version": "v1",
+            "name": "ikepolicy1"
+        }
+    }
+    to_sp_token, to_endpoint_url = get_connection_params(
+        idp_token, to_sp, 'network')
+    url = to_endpoint_url + '/v2.0/vpn/ikepolicies'
+    #logger.debug('creating IKE Policy')
+    resp = requests.post(
+        url, json=post_data, headers={
+            'X-Auth-Token': to_sp_token
+        })
+    IKE_info = resp.json()
+    add_to_DB(IKE_policy(sp_id=to_sp,
+                         name=IKE_info['ikepolicy']['name'],
+                         id=IKE_info['ikepolicy']['id']
+                         ))
+    write("3**. Time taken to create ike policy " + str(time.time() - time_taken_ike) + '\n')
+    return IKE_info['ikepolicy']['id']
+
+
+def create_vpn_s2s(idp_token, to_sp, peer_ext_gw, peer_subnet_cidr):
+    time_taken_s2s = time.time()
+    peer_subnet_cidrst = " ".join(str(x) for x in peer_subnet_cidr)
+    vpn_service_query = query_from_DB(VPN_service, {'sp_id': to_sp, 'status': "Unused"})
+    vpn_service_id = (str(vpn_service_query).split(",")[1]).split("=")[1]
+    ipsec_policy_info = query_from_DB(IPSEC_policy, {'sp_id': to_sp})
+    ipsec_policy_id = (str(ipsec_policy_info).split(",")[1]).split("=")[1]
+
+    ike_policy_info = query_from_DB(IKE_policy, {'sp_id': to_sp})
+    ike_policy_id = (str(ike_policy_info).split(",")[1]).split("=")[1]
+
+    post_data = {
+        "ipsec_site_connection": {
+            "name": "vpnconnection1@" + peer_subnet_cidrst,
+            "peer_address": peer_ext_gw,
+            "peer_id": peer_ext_gw,
+            "peer_cidrs": peer_subnet_cidr,
+            "psk": "vpnaas",
+            "ikepolicy_id": ike_policy_id,
+            "vpnservice_id": vpn_service_id,
+            "ipsecpolicy_id": ipsec_policy_id,
+
+        }
+    }
+
+    to_sp_token, to_endpoint_url = get_connection_params(
+        idp_token, to_sp, 'network')
+    url = to_endpoint_url + '/v2.0/vpn/ipsec-site-connections'
+    resp = requests.post(url,
+                         json=post_data,
+                         headers={'X-Auth-Token': to_sp_token})
+    s2s_info = resp.json()
+    add_to_DB(VPN_s2s(sp_id=to_sp,
+                      name="vpnconnection1@" + peer_subnet_cidrst,
+                      id=s2s_info['ipsec_site_connection']['id']))
+    update_in_DB(VPN_routers,
+                 columns=[VPN_routers.external_gw, VPN_routers.vpn_connectivity],
+                 keywords=[peer_ext_gw, "NO"],
+                 new_value_dic={'vpn_connectivity': 'Established'})
+    update_in_DB(VPN_service,
+                 columns=[VPN_service.id, VPN_service.status],
+                 keywords=[vpn_service_id, "Unused"],
+                 new_value_dic={'status': 'Used'})
+    write("4*/6*. Time taken to create s2s connectivity " + str(time.time()-time_taken_s2s)+'\n')
+    return s2s_info['ipsec_site_connection']['id']
+
+
+def update_routes(idp_token, to_sp, subnet_id, destination_cidr, next_hop):
+    time_routes=time.time()
+    #logger.debug('updating routes')
+    to_sp_token, to_endpoint_url = get_connection_params(
+        idp_token, to_sp, 'network')
+    post_url = to_endpoint_url + '/v2.0/subnets/{}'.format(subnet_id)
+    post_data = {
+        "subnet": {
+            "host_routes": [
+                {
+                    "destination": destination_cidr,
+                    "nexthop": next_hop
+                }
+            ]
+            }
+        }
+    resp = requests.put(
+            url=post_url, json=post_data, headers={
+                'X-Auth-Token': to_sp_token
+            })
+    write("5******.time taken for updating routes "+str(time.time()-time_routes)+'\n')
+    return 0
