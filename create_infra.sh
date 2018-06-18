@@ -10,6 +10,7 @@ echo creating router router_first
 extnet_id=$(curl -s -X GET -H "Content-Type: application/json" -H "X-Auth-Token: $Token" http://${controller_ip}:18090/network/v2.0/networks | jq -r '.networks| .[0].id')
 echo $extnet_id
 router_id=$(curl -s -X POST -H "Content-Type: application/json" -H "X-Auth-Token: $Token" -d '{"router": {"name": "router_first", "external_gateway_info": {"network_id": "'$extnet_id'"}}}' ${controller_ip}:18090/router/v2.0/routers | jq -r .router.id)
+#extnet_id=$(curl -s -X GET -H "Content-Type: application/json" -H "X-Auth-Token: $Token" http://${controller_ip}:18090/network/v2.0/networks |jq -r '.networks| .[]|select(.name=="public")|.id')
 echo router_id=$router_id
 
 
